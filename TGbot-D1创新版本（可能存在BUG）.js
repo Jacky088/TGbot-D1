@@ -1,3 +1,20 @@
+/**
+ * Telegram 双向机器人 Cloudflare Worker
+ * 实现了：人机验证、私聊到话题模式的转发、管理员回复中继、话题名动态更新、已编辑消息处理、用户屏蔽功能、关键词自动回复
+ * [修改] 存储已从 Cloudflare KV 切换到 D1 (SQLite) 以获取更高的写入容量。
+ * [新增] 完整的管理员配置菜单，包括：验证配置、自动回复、关键词屏蔽和按类型过滤。
+ * [修复] 修复了管理员配置输入后，用户状态未被正确标记为“已验证”，导致下一个消息流程出错的问题。
+ * [新增] 在按类型过滤中增加了：所有转发消息、音频/语音、贴纸/GIF 的过滤开关。
+ * [重构] 彻底重构了自动回复和关键词屏蔽的管理界面，引入了列表、新增、删除功能。
+ * [新增] 完整的管理员配置菜单。
+ * [新增] 备份群组功能：配置一个群组，用于接收所有用户消息的副本，不参与回复。
+ * [新增] 协管员授权功能：允许设置额外的管理员ID，他们可以绕过私聊验证并回复用户消息。
+ * * 部署要求: 
+ * 1. D1 数据库绑定，名称必须为 'TG_BOT_DB'。
+ * 2. 环境变量 ADMIN_IDS, BOT_TOKEN, ADMIN_GROUP_ID, 等不变。
+ */
+
+
 // --- 辅助函数 (D1 数据库抽象层) ---
 
 /**
@@ -191,24 +208,6 @@ function escapeHtml(text) {
       .replace(/>/g, '&gt;');
 }
 
-/**
- * [新增] 生成编辑通知文本 (符合用户指定格式)
- */
-function getEditedNotificationText(title, originalText, originalDate, newContent) {
-    return `
-⚠️ <b>${title}</b>
----
-<b>原始信息:</b> 
-<code>${escapeHtml(originalText)}</code>
-
-<b>原消息发送时间:</b> 
-<code>${originalDate}</code>
-
-<b>修改后的新内容:</b>
-${escapeHtml(newContent)}
-    `.trim();
-}
-
 function getUserInfo(user, initialTimestamp = null) {
     const userId = user.id.toString();
     const rawName = (user.first_name || "") + (user.last_name ? ` ${user.last_name}` : "");
@@ -388,7 +387,7 @@ async function telegramApi(token, methodName, params = {}) {
 }
 
 
-// --- 核心更新处理函数 [已修改] ---
+// --- 核心更新处理函数 ---
 
 export default {
   async fetch(request, env, ctx) {
@@ -422,15 +421,8 @@ async function handleUpdate(update, env) {
             await handleAdminReply(update.message, env);
         }
     } else if (update.edited_message) {
-        const editedMessage = update.edited_message;
-        const chatId = editedMessage.chat.id.toString();
-
-        if (chatId === env.ADMIN_GROUP_ID) {
-            // 新增逻辑：处理管理员群组中的编辑消息
-            await handleAdminEditedMessage(editedMessage, env);
-        } else if (editedMessage.chat.type === "private") {
-            // 原始逻辑：处理用户私聊中的编辑消息
-            await handleRelayEditedMessage(editedMessage, env);
+        if (update.edited_message.chat.type === "private") {
+            await handleRelayEditedMessage(update.edited_message, env);
         }
     } else if (update.callback_query) {
         await handleCallbackQuery(update.callback_query, env);
@@ -704,9 +696,81 @@ async function handleVerification(chatId, answer, env) {
     }
 }
 
+  /**
+   * [修改] 处理管理员在话题中修改消息的逻辑。
+   * 现在会查询原始消息内容和时间，并以详细格式通知用户。
+   */
+  async function handleAdminEditedReply(editedMessage, env) {
+    // 检查是否是话题内的消息
+    if (!editedMessage.is_topic_message || !editedMessage.message_thread_id) return;
+
+    // 检查是否来自管理员群组
+    const adminGroupIdStr = env.ADMIN_GROUP_ID.toString();
+    if (editedMessage.chat.id.toString() !== adminGroupIdStr) return;
+
+    // 忽略机器人自己的消息
+    if (editedMessage.from && editedMessage.from.is_bot) return;
+
+    // 检查消息发送者是否是授权协管员或主管理员
+    const senderId = editedMessage.from.id.toString();
+    const isAuthorizedAdmin = await isAdminUser(senderId, env);
+    
+    if (!isAuthorizedAdmin) {
+        return; 
+    }
+
+    const topicId = editedMessage.message_thread_id.toString();
+    // 从 D1 根据 topic_id 查找 user_id (私聊目标)
+    const userId = await dbTopicUserGet(topicId, env);
+    if (!userId) return;
+
+    // 1. 从消息表中查找原始消息的文本和发送日期
+    const messageId = editedMessage.message_id.toString();
+    // 使用 user_id (私聊ID) + messageId (管理员群组消息ID) 作为键
+    const storedMessage = await dbMessageDataGet(userId, messageId, env);
+    if (!storedMessage) return; // 找不到原始消息，无法通知
+
+    const newText = editedMessage.text || editedMessage.caption || "[媒体内容]";
+
+    // 2. 格式化时间
+    // storedMessage.date 存储的是原发送时间或上次编辑后的时间
+    const originalTime = formatTimestamp(storedMessage.date); 
+    // editedMessage.edit_date 是本次编辑的时间
+    const editTime = formatTimestamp(editedMessage.edit_date || editedMessage.date); 
+    
+    // 3. 构造通知文本 (使用 HTML 解析模式以支持 <b> 和 <code>)
+    const notificationText = `
+⚠️ <b>管理员编辑了回复</b>
+---
+<b>原发送/上次编辑时间:</b> <code>${originalTime}</code>
+<b>本次编辑时间:</b> <code>${editTime}</code>
+---
+<b>原消息内容：</b>
+${escapeHtml(storedMessage.text)}
+---
+<b>新消息内容：</b>
+${escapeHtml(newText)}
+    `.trim();
+
+    try {
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: userId,
+            text: notificationText,
+            parse_mode: "HTML",
+        });
+
+        // 4. 更新消息表中的存储内容 (用于下次编辑时作为"原消息")
+        await dbMessageDataPut(userId, messageId, { text: newText, date: editedMessage.edit_date || editedMessage.date }, env);
+
+    } catch (e) {
+        // 如果发送失败，记录错误
+        console.error("handleAdminEditedReply: Failed to send edited message to user:", e?.message || e);
+    }
+}
+
 // --- 管理员配置主菜单逻辑 (使用 D1) ---
 
-async function handleAdminConfigStart(chatId, env) {
+async function handleAdminConfigStart(chatId, env, messageId = 0) { // <--- MODIFIED: 增加 messageId 参数
     const isPrimary = isPrimaryAdmin(chatId, env);
     if (!isPrimary) {
         // 非主管理员不显示配置菜单
@@ -741,24 +805,28 @@ async function handleAdminConfigStart(chatId, env) {
     // 清除任何未完成的编辑状态
     await dbAdminStateDelete(chatId, env);
 
-    // 检查是否是编辑旧消息的回调（从其他子菜单返回）
-    if (env.last_config_message_id) {
-        await telegramApi(env.BOT_TOKEN, "editMessageText", {
-            chat_id: chatId,
-            message_id: env.last_config_message_id,
-            text: menuText,
-            parse_mode: "HTML",
-            reply_markup: menuKeyboard,
-        }).catch(e => console.error("尝试编辑旧菜单失败:", e.message)); // 忽略编辑失败
-        return;
-    }
-
-
-    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+    // [优化] 统一的编辑/发送逻辑：如果提供了 messageId，则编辑；否则发送新消息。
+    const apiMethod = (messageId && messageId !== 0) ? "editMessageText" : "sendMessage";
+    const params = {
         chat_id: chatId,
         text: menuText,
         parse_mode: "HTML",
         reply_markup: menuKeyboard,
+    };
+    if (apiMethod === "editMessageText") {
+        params.message_id = messageId;
+    }
+    
+    // 尝试执行操作，如果编辑失败（如消息已删除），则发送新消息作为回退。
+    await telegramApi(env.BOT_TOKEN, apiMethod, params).catch(e => {
+        if (apiMethod === "editMessageText") {
+            console.warn("Edit main menu failed, attempting to send new message instead:", e.message);
+            // Fallback to sending new message (ignore if this also fails)
+            delete params.message_id; 
+            telegramApi(env.BOT_TOKEN, "sendMessage", params).catch(e2 => console.error("Fallback sendMessage also failed:", e2.message));
+        } else {
+            console.error("Error sending main menu:", e.message);
+        }
     });
 }
 
@@ -1404,9 +1472,9 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
     }
 
     // 存储文本消息的原始内容到 messages 表 (用于处理已编辑消息)
-    if (message.text || message.caption) {
+    if (message.text) {
         const messageData = {
-            text: message.text || message.caption || '',
+            text: message.text,
             date: message.date
         };
         await dbMessageDataPut(userId, message.message_id.toString(), messageData, env);
@@ -1522,8 +1590,7 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
 }
 
 /**
-* 处理用户在私聊中修改消息的逻辑。[已重写]
-* (私聊 -> 管理员群组/话题)
+* 处理用户在私聊中修改消息的逻辑。
 */
 async function handleRelayEditedMessage(editedMessage, env) {
     const { from: user } = editedMessage;
@@ -1542,9 +1609,6 @@ async function handleRelayEditedMessage(editedMessage, env) {
     let originalText = "[原始内容无法获取/非文本内容]";
     let originalDate = "[发送时间无法获取]";
     
-    // 新内容（可能是文本或媒体说明）
-    const newContent = editedMessage.text || editedMessage.caption || "[非文本/媒体说明内容]";
-
     if (storedData) {
         originalText = storedData.text || originalText;
         originalDate = new Date(storedData.date * 1000).toLocaleString('zh-CN');
@@ -1556,14 +1620,21 @@ async function handleRelayEditedMessage(editedMessage, env) {
         };
         await dbMessageDataPut(userId, editedMessage.message_id.toString(), updatedData, env);
     }
+
+    const newContent = editedMessage.text || editedMessage.caption || "[非文本/媒体说明内容]";
     
-    // 生成通知文本
-    const notificationText = getEditedNotificationText(
-        "用户消息已修改", 
-        originalText, 
-        originalDate, 
-        newContent
-    );
+    const notificationText = `
+⚠️ <b>用户消息已修改</b>
+---
+<b>原始信息:</b> 
+<code>${escapeHtml(originalText)}</code>
+
+<b>原消息发送时间:</b> 
+<code>${originalDate}</code>
+
+<b>修改后的新内容:</b>
+${escapeHtml(newContent)}
+    `.trim();
     
     try {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
@@ -1574,91 +1645,9 @@ async function handleRelayEditedMessage(editedMessage, env) {
         });
         
     } catch (e) {
-        console.error("处理用户已编辑消息失败:", e.message);
+        console.error("处理已编辑消息失败:", e.message);
     }
 }
-
-
-/**
-* [新增] 处理管理员在群组中修改消息的逻辑。
-* (管理员群组/话题 -> 私聊用户)
-*/
-async function handleAdminEditedMessage(editedMessage, env) {
-    // 1. 获取 topicId (即 message_thread_id)
-    const topicId = editedMessage.message_thread_id;
-    if (!topicId) {
-        return; // 非话题内的编辑不处理
-    }
-    
-    // 2. 根据 topicId 查找对应的私聊用户 ID
-    const userId = await dbTopicUserGet(topicId.toString(), env);
-    if (!userId) {
-        return; // 找不到对应用户
-    }
-
-    // 3. 检查编辑者是否是管理员。
-    const adminId = editedMessage.from.id.toString();
-    const isAdmin = await isAdminUser(adminId, env);
-    
-    // 忽略非管理员的编辑行为
-    if (!isAdmin) {
-        return;
-    }
-
-    // --- 4. 获取原始消息内容（Admin Message Tracking Logic） ---
-    // 使用 ADMIN_GROUP_ID 作为 user_id 的占位符来存储管理员的消息历史。
-    const adminMessageId = editedMessage.message_id.toString();
-
-    // 尝试获取该 Admin 消息的原始数据
-    // 注意：这里的 user_id 必须是 env.ADMIN_GROUP_ID，因为管理员消息是存入该 ID下的
-    const storedData = await dbMessageDataGet(env.ADMIN_GROUP_ID, adminMessageId, env);
-    let originalText = "[原始管理员回复内容无法获取]";
-    let originalDate = "[原消息发送时间无法获取]";
-    
-    const newContent = editedMessage.text || editedMessage.caption || "[非文本/媒体说明内容]";
-    
-    if (storedData) {
-        originalText = storedData.text || originalText;
-        originalDate = new Date(storedData.date * 1000).toLocaleString('zh-CN');
-
-        // 更新 D1，将新内容存储为该消息的最新“原始”内容
-        const updatedData = { 
-            text: editedMessage.text || editedMessage.caption || '',
-            // 保持原始发送时间不变
-            date: storedData.date 
-        };
-        // 关键：将更新后的内容存储为下一次编辑的“原始”内容
-        await dbMessageDataPut(env.ADMIN_GROUP_ID, adminMessageId, updatedData, env);
-    } else {
-        // 如果找不到历史记录 (即 handleAdminReply 没有存储)，我们现在存储它作为初始版本。
-        const initialStoreData = {
-            text: newContent,
-            date: editedMessage.date // 使用编辑时间作为 fallback
-        };
-        await dbMessageDataPut(env.ADMIN_GROUP_ID, adminMessageId, initialStoreData, env);
-    }
-
-    // 5. 生成通知文本 (使用指定格式)
-    const notificationText = getEditedNotificationText(
-        "管理员消息已修改", // 标题
-        originalText, 
-        originalDate, 
-        newContent
-    );
-    
-    // 6. 将通知发送回用户私聊
-    try {
-        await telegramApi(env.BOT_TOKEN, "sendMessage", {
-            chat_id: userId,
-            text: notificationText,
-            parse_mode: "HTML", 
-        });
-        
-    } catch (e) {
-        console.error(`向用户 ${userId} 发送管理员编辑通知失败:`, e.message);
-    }
-}
-
 
 /**
 * 处理置顶资料卡消息的操作。
@@ -1735,9 +1724,10 @@ async function handleCallbackQuery(callbackQuery, env) {
             // [新增] 协管员授权菜单导航
             } else if (keyOrAction === 'authorized') {
                 await handleAdminAuthorizedConfigMenu(chatId, message.message_id, env);
-            } else { // config:menu (主菜单)
-                // 刷新主菜单，尝试编辑原消息
-                await handleAdminConfigStart(chatId, env);
+            } else { 
+                // [优化] config:menu (主菜单) 
+                // 刷新主菜单/返回主菜单，将消息ID传入，尝试编辑原消息
+                await handleAdminConfigStart(chatId, env, message.message_id); // <--- MODIFIED: 传入 message.message_id
             }
         // --- 切换开关处理 (用于内容过滤) ---
         } else if (actionType === 'toggle' && keyOrAction && value) {
@@ -1923,7 +1913,7 @@ async function handleUnblockUser(userId, message, env) {
 
 
 /**
- * 将管理员在话题中的回复转发回用户。[已修改，新增消息内容存储]
+ * 将管理员在话题中的回复转发回用户。
  */
 async function handleAdminReply(message, env) {
     // 检查是否是话题内的消息
@@ -1951,28 +1941,17 @@ async function handleAdminReply(message, env) {
     // 从 D1 根据 topic_id 查找 user_id
     const userId = await dbTopicUserGet(topicId, env);
     if (!userId) return;
-    
-    const msgId = message.message_id;
 
     try {
         // 尝试直接 copyMessage
         const fromChatId = message.chat.id;
+        const msgId = message.message_id;
 
         await telegramApi(env.BOT_TOKEN, "copyMessage", {
             chat_id: userId,
             from_chat_id: fromChatId,
             message_id: msgId,
         });
-        
-        // 消息中继成功后，存储管理员的消息内容（用于编辑跟踪）
-        if (message.text || message.caption) {
-            const adminMessageData = {
-                text: message.text || message.caption || '',
-                date: message.date
-            };
-            // 使用 env.ADMIN_GROUP_ID 作为 user_id 的标识符，存储管理员的消息历史
-            await dbMessageDataPut(env.ADMIN_GROUP_ID, msgId.toString(), adminMessageData, env);
-        }
 
     } catch (e) {
         // 如果 copyMessage 失败 (例如：文件太大, 特殊内容)，则尝试 fallback 逐个发送
