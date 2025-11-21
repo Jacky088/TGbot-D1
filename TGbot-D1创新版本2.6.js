@@ -1256,7 +1256,8 @@ async function ensureBlockLogTopicExists(env) {
   }
   
 /**
-* 按类型过滤子菜单 - 兼容编辑和发送新消息
+* 按类型过滤子菜单 - [⭐️ 现代美化版]
+* 放弃强制对齐的表格，使用清爽的列表样式
 */
 async function handleAdminTypeBlockMenu(chatId, messageId, env) {
     // 获取当前状态
@@ -1265,50 +1266,60 @@ async function handleAdminTypeBlockMenu(chatId, messageId, env) {
     const textStatus = (await getConfig('enable_text_forwarding', env, 'true')).toLowerCase() === 'true';
     const audioVoiceStatus = (await getConfig('enable_audio_forwarding', env, 'true')).toLowerCase() === 'true';
     const stickerGifStatus = (await getConfig('enable_sticker_forwarding', env, 'true')).toLowerCase() === 'true';
+    const userForwardStatus = (await getConfig('enable_user_forwarding', env, 'true')).toLowerCase() === 'true'; 
+    const groupForwardStatus = (await getConfig('enable_group_forwarding', env, 'true')).toLowerCase() === 'true'; 
+    const channelForwardStatus = (await getConfig('enable_channel_forwarding', env, 'true')).toLowerCase() === 'true'; 
+  
+    // [⭐️ 样式优化] 状态显示：前面放 Emoji，文字简短
+    // 这种格式： "✅ 允许" 或 "❌ 屏蔽"
+    const s = (status) => status ? "✅ <b>允许</b>" : "❌ <b>屏蔽</b>";
     
-    // [⭐️ 新增] 获取三个细分的转发状态
-    const userForwardStatus = (await getConfig('enable_user_forwarding', env, 'true')).toLowerCase() === 'true'; // 用户
-    const groupForwardStatus = (await getConfig('enable_group_forwarding', env, 'true')).toLowerCase() === 'true'; // 群组
-    const channelForwardStatus = (await getConfig('enable_channel_forwarding', env, 'true')).toLowerCase() === 'true'; // 频道
+    // 回调数据构造
+    const cb = (key, status) => `config:toggle:${key}:${status ? 'false' : 'true'}`;
+    
+    // 按钮上的文字（为了按钮整齐，按钮上可以保留纯文字描述）
+    const btnText = (status) => status ? "✅ 允许" : "❌ 屏蔽";
   
-    const statusToText = (status) => status ? "✅ 允许" : "❌ 屏蔽";
-    const statusToCallback = (key, status) => `config:toggle:${key}:${status ? 'false' : 'true'}`;
-  
-    // [⭐️ 修改] 更新表格说明，增加到 8 项
+    // [⭐️ 核心修改] 现代列表排版
+    // 1. 移除 <pre> 标签（去掉灰色背景）
+    // 2. 使用 序号. 状态 | 项目名称 的格式
+    // 3. 加粗项目名称，突出重点
     const menuText = `
-  🔗 <b>按类型过滤管理</b>
-  点击下方对应序号的按钮切换状态 (切换后立即生效)。
-  
-  | 序号 | 类型 | 状态 |
-  | :--- | :--- | :--- |
-  | 1 | <b>转发消息 (来自用户)</b> | ${statusToText(userForwardStatus)} |
-  | 2 | <b>转发消息 (来自群组)</b> | ${statusToText(groupForwardStatus)} |
-  | 3 | <b>转发消息 (来自频道)</b> | ${statusToText(channelForwardStatus)} |
-  | 4 | 音频/语音消息 | ${statusToText(audioVoiceStatus)} |
-  | 5 | 贴纸/GIF (动画) | ${statusToText(stickerGifStatus)} |
-  | 6 | 图片/视频/文件 | ${statusToText(mediaStatus)} |
-  | 7 | 链接消息 | ${statusToText(linkStatus)} |
-  | 8 | 纯文本消息 | ${statusToText(textStatus)} |
+🔗 <b>按类型过滤管理</b>
+点击下方按钮切换状态。
+
+<b>--- 转发来源控制 ---</b>
+1. ${s(userForwardStatus)} | 转发消息 (用户)
+2. ${s(groupForwardStatus)} | 转发消息 (群组)
+3. ${s(channelForwardStatus)} | 转发消息 (频道)
+
+<b>--- 媒体类型控制 ---</b>
+4. ${s(audioVoiceStatus)} | 音频/语音消息
+5. ${s(stickerGifStatus)} | 贴纸/GIF (动画)
+6. ${s(mediaStatus)} | 图片/视频/文件
+
+<b>--- 基础内容控制 ---</b>
+7. ${s(linkStatus)} | 链接消息
+8. ${s(textStatus)} | 纯文本消息
     `.trim();
   
-    // [⭐️ 修改] 更新按钮布局，对应上方序号
     const menuKeyboard = {
         inline_keyboard: [
             [
-                { text: `1. ${statusToText(userForwardStatus)}`, callback_data: statusToCallback('enable_user_forwarding', userForwardStatus) },
-                { text: `2. ${statusToText(groupForwardStatus)}`, callback_data: statusToCallback('enable_group_forwarding', groupForwardStatus) }
+                { text: `1. ${btnText(userForwardStatus)}`, callback_data: cb('enable_user_forwarding', userForwardStatus) },
+                { text: `2. ${btnText(groupForwardStatus)}`, callback_data: cb('enable_group_forwarding', groupForwardStatus) }
             ],
             [
-                { text: `3. ${statusToText(channelForwardStatus)}`, callback_data: statusToCallback('enable_channel_forwarding', channelForwardStatus) },
-                { text: `4. ${statusToText(audioVoiceStatus)}`, callback_data: statusToCallback('enable_audio_forwarding', audioVoiceStatus) }
+                { text: `3. ${btnText(channelForwardStatus)}`, callback_data: cb('enable_channel_forwarding', channelForwardStatus) },
+                { text: `4. ${btnText(audioVoiceStatus)}`, callback_data: cb('enable_audio_forwarding', audioVoiceStatus) }
             ],
             [
-                { text: `5. ${statusToText(stickerGifStatus)}`, callback_data: statusToCallback('enable_sticker_forwarding', stickerGifStatus) },
-                { text: `6. ${statusToText(mediaStatus)}`, callback_data: statusToCallback('enable_image_forwarding', mediaStatus) }
+                { text: `5. ${btnText(stickerGifStatus)}`, callback_data: cb('enable_sticker_forwarding', stickerGifStatus) },
+                { text: `6. ${btnText(mediaStatus)}`, callback_data: cb('enable_image_forwarding', mediaStatus) }
             ],
             [
-                { text: `7. ${statusToText(linkStatus)}`, callback_data: statusToCallback('enable_link_forwarding', linkStatus) },
-                { text: `8. ${statusToText(textStatus)}`, callback_data: statusToCallback('enable_text_forwarding', textStatus) }
+                { text: `7. ${btnText(linkStatus)}`, callback_data: cb('enable_link_forwarding', linkStatus) },
+                { text: `8. ${btnText(textStatus)}`, callback_data: cb('enable_text_forwarding', textStatus) }
             ],
             [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
         ]
@@ -1325,7 +1336,7 @@ async function handleAdminTypeBlockMenu(chatId, messageId, env) {
         params.message_id = messageId;
     }
     await telegramApi(env.BOT_TOKEN, apiMethod, params);
-  }
+}
   
   
   /**
